@@ -2,104 +2,139 @@ import os
 import csv
 import subprocess
 from datetime import datetime
+import logging
+from pathlib import Path
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
-LOG_FILE = "MigrationLog.txt"
-OUTPUT_CSV = "MigrationDetails.csv"
-LOGS_DIR = "logs"
-CSV_FILE = "repos.csv"
-ENV_FILE = ".env"
-
-def log_message(message, level="INFO"):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"{timestamp} [{level}] {message}"
-    print(log_entry)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(log_entry + "\n")
-
-# Load .env
-if not os.path.exists(ENV_FILE):
-    log_message(".env file not found.", "ERROR")
-    exit(1)
-load_dotenv(ENV_FILE)
-GH_SOURCE_PAT = os.getenv("GH_PAT")
-GH_PAT = os.getenv("TARGET_GH_PAT")
-SOURCE = os.getenv("GH_ORG")
-DESTINATION = os.getenv("TARGET_GH_ORG")
-
-if not all([GH_SOURCE_PAT, GH_PAT, SOURCE, DESTINATION]):
-    log_message("Required environment variables missing. Ensure GH_SOURCE_PAT, GH_PAT, SOURCE, DESTINATION are set in .env file.", "ERROR")
-    exit(1)
-
-# Prepare logs dir and log file
-os.makedirs(LOGS_DIR, exist_ok=True)
-with open(LOG_FILE, "w", encoding="utf-8") as f:
-    f.write(f"Migration Log - {datetime.now()}\n")
-
-# Prepare output CSV
-if not os.path.exists(OUTPUT_CSV):
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "SourceOrg", "SourceRepo", "TargetOrg", "TargetRepo",
-            "Status", "StartTime", "EndTime", "TimeTakenSeconds", "TimeTakenMinutes"
-        ])
-
-# Check repos.csv
-if not os.path.exists(CSV_FILE):
-    log_message(f"CSV file {CSV_FILE} not found. Please create with columns: CURRENT-NAME,NEW-NAME", "ERROR")
-    exit(1)
-
-# Read and process each repo
-with open(CSV_FILE, newline='', encoding='utf-8') as csvfile:
-    reader = csv.DictReader(csvfile)
-    for row in reader:
-        current_name = row.get("CURRENT-NAME", "").strip()
-        new_name = row.get("NEW-NAME", "").strip()
-        if not current_name or not new_name:
-            log_message("Missing CURRENT-NAME or NEW-NAME in CSV row. Skipping.", "ERROR")
-            continue
-
-        log_message(f"Migrating '{current_name}' -> '{new_name}'...")
-        start_time = datetime.now()
-        status = "Success"
-
-        command = [
-            "gh", "gei", "migrate-repo",
-            "--github-source-org", SOURCE,
-            "--source-repo", current_name,
-            "--github-target-org", DESTINATION,
-            "--target-repo", new_name
+def setup_logging(log_file: str) -> None:
+    """Initialize logging configuration."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
         ]
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-            output = result.stdout + result.stderr
-            log_message(f"Command output for '{current_name}': {output}")
-            if result.returncode != 0 or "error" in output.lower() or "failed" in output.lower():
-                status = "Failed"
-                repo_log_file = os.path.join(LOGS_DIR, f"{current_name}.log")
-                with open(repo_log_file, "w", encoding="utf-8") as logf:
-                    logf.write(output)
-                log_message(f"Error log saved to {repo_log_file}", "ERROR")
-        except Exception as e:
+    )
+
+def create_directory(path: str) -> None:
+    """Create directory if it doesn't exist."""
+    Path(path).mkdir(exist_ok=True)
+
+def validate_env_vars() -> bool:
+    """Validate required environment variables."""
+    required_vars = ['GH_SOURCE_PAT', 'GH_PAT', 'SOURCE', 'DESTINATION']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logging.error(f"Required environment variables missing: {', '.join(missing_vars)}")
+        return False
+    return True
+
+def initialize_csv_output(output_file: str) -> None:
+    """Initialize the output CSV file with headers."""
+    if not Path(output_file).exists():
+        headers = ['SourceOrg', 'SourceRepo', 'TargetOrg', 'TargetRepo', 
+                  'Status', 'StartTime', 'EndTime', 'TimeTakenSeconds', 'TimeTakenMinutes']
+        with open(output_file, 'w', newline='') as f:
+            csv.writer(f).writerow(headers)
+
+def migrate_repository(current_name: str, new_name: str, logs_folder: str, output_csv: str) -> None:
+    """Migrate a single repository and log the results."""
+    start_time = datetime.now()
+    status = "Success"
+    
+    command = f"gh gei migrate-repo --github-source-org {os.getenv('SOURCE')} " \
+              f"--source-repo {current_name} --github-target-org {os.getenv('DESTINATION')} " \
+              f"--target-repo {new_name}"
+    
+    try:
+        output = subprocess.run(command, shell=True, capture_output=True, text=True)
+        
+        if output.returncode != 0 or 'error' in output.stdout.lower() or 'failed' in output.stdout.lower():
             status = "Failed"
-            repo_log_file = os.path.join(LOGS_DIR, f"{current_name}.log")
-            with open(repo_log_file, "w", encoding="utf-8") as logf:
-                logf.write(str(e))
-            log_message(f"Exception caught during migration of '{current_name}'. See {repo_log_file} for details.", "ERROR")
+            repo_log_file = Path(logs_folder) / f"{current_name}.log"
+            with open(repo_log_file, 'w') as f:
+                f.write(output.stdout + output.stderr)
+            logging.error(f"Error log saved to {repo_log_file}")
+        
+        logging.info(f"Command output for '{current_name}': {output.stdout}")
+        
+    except Exception as e:
+        status = "Failed"
+        repo_log_file = Path(logs_folder) / f"{current_name}.log"
+        with open(repo_log_file, 'w') as f:
+            f.write(str(e))
+        logging.error(f"Exception caught during migration of '{current_name}'. See {repo_log_file} for details.")
+    
+    end_time = datetime.now()
+    time_taken = (end_time - start_time).total_seconds()
+      # Write migration details to CSV
+    with open(output_csv, 'a', newline='') as f:
+        csv.writer(f).writerow([
+            os.getenv('SOURCE'),
+            current_name,
+            os.getenv('DESTINATION'),
+            new_name,
+            status,
+            start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            f"{time_taken:.2f}",
+            f"{(time_taken / 60):.2f}"
+        ])
+    
+    logging.info(f"Migration result: Status={status}, Duration={time_taken:.2f}s")
 
-        end_time = datetime.now()
-        time_taken = round((end_time - start_time).total_seconds(), 2)
-        time_taken_minutes = round(time_taken / 60, 2)
+def main():
+    # Initialize constants
+    LOG_FILE = "MigrationLog.txt"
+    OUTPUT_CSV = "MigrationDetails.csv"
+    LOGS_FOLDER = "logs"
+    ENV_FILE = ".env"
+    REPOS_CSV = "repos.csv"
+    
+    # Setup logging and create necessary directories
+    setup_logging(LOG_FILE)
+    create_directory(LOGS_FOLDER)
+    
+    logging.info("Starting GitHub repository migration script...")
+    
+    # Load environment variables
+    if Path(ENV_FILE).exists():
+        load_dotenv(ENV_FILE)
+        logging.info(f"Loaded environment variables from {ENV_FILE}")
+    else:
+        logging.error(f"{ENV_FILE} file not found.")
+        return
+    
+    # Validate environment variables
+    if not validate_env_vars():
+        return
+    
+    # Check for repos.csv
+    if not Path(REPOS_CSV).exists():
+        logging.error(f"CSV file {REPOS_CSV} not found. Please create with columns: CURRENT-NAME, NEW-NAME")
+        return
+    
+    # Initialize output CSV
+    initialize_csv_output(OUTPUT_CSV)
+    
+    # Process repositories
+    with open(REPOS_CSV, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            current_name = row.get('CURRENT-NAME')
+            new_name = row.get('NEW-NAME')
+            
+            if not current_name or not new_name:
+                logging.error("Missing CURRENT-NAME or NEW-NAME in CSV row. Skipping.")
+                continue
+            
+            logging.info(f"Migrating '{current_name}' -> '{new_name}'...")
+            migrate_repository(current_name, new_name, LOGS_FOLDER, OUTPUT_CSV)
+    
+    logging.info("All repository migrations complete!")
 
-        # Write details to CSV
-        with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                SOURCE, current_name, DESTINATION, new_name,
-                status, start_time.strftime("%Y-%m-%d %H:%M:%S"),
-                end_time.strftime("%Y-%m-%d %H:%M:%S"), time_taken, time_taken_minutes
-            ])
-        log_message(f"Migration result: Status={status}, Duration={time_taken}s ({time_taken_minutes}m)")
-
-log_message("All repository migrations complete!")
+if __name__ == "__main__":
+    main()
